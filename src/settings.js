@@ -4,7 +4,9 @@ import { useSyncExternalStore } from 'react';
  * Saved OAuth apps live only in this browser's localStorage (per origin), never in source files.
  * They stay until the user deletes them in the Settings dialog or clears site data.
  *
- * Shape: { activeId, apps: [{ id, name, baseUrl, clientId, clientSecret, scope, grantType, brokerUri }], maskSecretsInLogs }
+ * Shape: { activeId, maskSecretsInLogs, apps: [{ id, name, provider, baseUrl, brokerUri,
+ *          authorizationEndpoint, tokenEndpoint, userinfoEndpoint, endSessionEndpoint, discoveryUrl,
+ *          clientId, clientSecret, tokenAuthMethod, scope, grantType }] }
  */
 const STORAGE_KEY = 'oauth-tester:apps:v2';
 const LEGACY_KEY = 'mo-sso-tester:settings:v1'; // single-app format, migrated on first load
@@ -24,9 +26,23 @@ export const needsSecret = (grantType) =>
 /** Grant types that call the token endpoint directly, without redirecting to the login page. */
 export const isDirectGrant = (grantType) => grantType === 'password' || grantType === 'client_credentials';
 
+export const TOKEN_AUTH_METHODS = [
+  { value: 'client_secret_post', label: 'client_secret_post (in the form body)' },
+  { value: 'client_secret_basic', label: 'client_secret_basic (Authorization header)' },
+];
+
 export const DEFAULT_APP = {
   name: '',
+  provider: 'custom',
+  // provider presets (e.g. miniOrange)
   baseUrl: '',
+  // custom provider
+  authorizationEndpoint: '',
+  tokenEndpoint: '',
+  userinfoEndpoint: '',
+  endSessionEndpoint: '',
+  discoveryUrl: '',
+  tokenAuthMethod: 'client_secret_post',
   clientId: '',
   clientSecret: '',
   scope: 'openid email profile',
@@ -52,11 +68,22 @@ export const hostOf = (url) => {
 const newId = () =>
   globalThis.crypto?.randomUUID?.() || `app-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
+/** Domain shown for an app in the switcher. */
+export const appHost = (a) =>
+  hostOf(a.provider === 'custom' ? a.authorizationEndpoint || a.tokenEndpoint || a.discoveryUrl : a.baseUrl);
+
+const trimUrl = (v) => (v || '').trim();
+
 const normalizeApp = (a) => ({
   ...DEFAULT_APP,
   ...a,
-  name: (a.name || '').trim() || hostOf((a.baseUrl || '').trim()) || 'Untitled app',
+  name: (a.name || '').trim() || appHost(a) || 'Untitled app',
   baseUrl: (a.baseUrl || '').trim().replace(/\/+$/, ''),
+  authorizationEndpoint: trimUrl(a.authorizationEndpoint),
+  tokenEndpoint: trimUrl(a.tokenEndpoint),
+  userinfoEndpoint: trimUrl(a.userinfoEndpoint),
+  endSessionEndpoint: trimUrl(a.endSessionEndpoint),
+  discoveryUrl: trimUrl(a.discoveryUrl),
   clientId: (a.clientId || '').trim(),
   clientSecret: (a.clientSecret || '').trim(),
   scope: (a.scope || '').trim().replace(/\s+/g, ' '),
@@ -70,12 +97,15 @@ const read = () => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...EMPTY_STATE, ...parsed, apps: Array.isArray(parsed.apps) ? parsed.apps : [] };
+      const apps = (Array.isArray(parsed.apps) ? parsed.apps : []).map((a) =>
+        a.provider ? a : { ...a, provider: 'miniorange' } // saved before providers existed
+      );
+      return { ...EMPTY_STATE, ...parsed, apps };
     }
     const legacy = localStorage.getItem(LEGACY_KEY);
     if (legacy) {
       const { maskSecretsInLogs = false, ...old } = JSON.parse(legacy);
-      const app = { ...normalizeApp(old), id: newId() };
+      const app = { ...normalizeApp({ ...old, provider: 'miniorange' }), id: newId() };
       const migrated = { activeId: app.id, apps: [app], maskSecretsInLogs };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
       localStorage.removeItem(LEGACY_KEY);
@@ -149,26 +179,29 @@ export const deleteApp = (id) => {
 export const clearAllApps = () => {
   commit({ ...EMPTY_STATE });
   try {
-    // Leftovers from mo-oauth-sdk's last login attempt.
-    sessionStorage.removeItem('state');
-    sessionStorage.removeItem('code_verifier');
+    // Leftover pending login (state, nonce, PKCE verifier).
+    sessionStorage.removeItem('oauth-playground:pending-login');
   } catch {
     /* storage blocked */
   }
 };
 
-export const isConfigured = (s = snapshot) =>
-  Boolean(s.id && s.baseUrl && s.clientId && (!needsSecret(s.grantType) || s.clientSecret));
-
-/** Fields that must be filled before login; empty array means ready. */
+/** Fields that must be filled before the current grant can run; empty array means ready. */
 export const missingFields = (s = snapshot) => {
   if (!s.id) return ['an app'];
   const missing = [];
-  if (!s.baseUrl) missing.push('Base URL');
+  if (s.provider === 'custom') {
+    if (!isDirectGrant(s.grantType) && !s.authorizationEndpoint) missing.push('Authorization endpoint');
+    if (s.grantType !== 'implicit' && !s.tokenEndpoint) missing.push('Token endpoint');
+  } else if (!s.baseUrl) {
+    missing.push('Base URL');
+  }
   if (!s.clientId) missing.push('Client ID');
   if (needsSecret(s.grantType) && !s.clientSecret) missing.push('Client secret');
   return missing;
 };
+
+export const isConfigured = (s = snapshot) => missingFields(s).length === 0;
 
 const subscribe = (fn) => {
   listeners.add(fn);

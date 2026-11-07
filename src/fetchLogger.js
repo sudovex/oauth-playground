@@ -1,9 +1,8 @@
 import { logger } from './logger';
 
 /**
- * Wraps window.fetch so every HTTP call made by the app (including the ones made inside
- * mo-oauth-sdk: token exchange, userinfo, introspect) is logged with its full request and response.
- * mo-oauth-sdk swallows error bodies, so this is the only place the real miniOrange error shows up.
+ * Wraps window.fetch so every HTTP call made by the app (token, userinfo, discovery) is logged with its
+ * full request and response, including error bodies.
  */
 const headersToObject = (headers) => {
   if (!headers) return {};
@@ -61,8 +60,8 @@ export const installFetchLogger = () => {
       logger.error(step, `✗ ${method} ${url} failed after ${Math.round(performance.now() - started)} ms`, {
         error: err.message,
         hint:
-          'A network/TypeError here usually means CORS: the miniOrange endpoint did not allow this origin ' +
-          '(check the browser Network tab), or the URL / baseUrl is wrong.',
+          'A network/TypeError here usually means CORS: the server did not allow this origin ' +
+          '(check the browser Network tab), or the URL is wrong.',
       });
       throw err;
     }

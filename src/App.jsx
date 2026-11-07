@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { startAuthorization, logout } from 'mo-oauth-sdk';
 import {
   Alert,
   AppBar,
@@ -55,12 +54,22 @@ import PersonRoundedIcon from '@mui/icons-material/PersonRounded';
 import LockRoundedIcon from '@mui/icons-material/LockRounded';
 import VisibilityRoundedIcon from '@mui/icons-material/VisibilityRounded';
 import VisibilityOffRoundedIcon from '@mui/icons-material/VisibilityOffRounded';
-import { buildOAuthConfig, endpointUrl } from './oauth';
+import {
+  buildAuthorizationRequest,
+  buildLogoutUrl,
+  buildTokenRequest,
+  clearPendingLogin,
+  getPendingLogin,
+  resolveEndpoints,
+  savePendingLogin,
+} from './oauth';
+import { PROVIDERS, providerLabel } from './providers';
 import {
   appUrl,
   CALLBACK_PATH,
   GRANT_TYPES,
   isConfigured,
+  appHost,
   isDirectGrant,
   missingFields,
   redirectUri,
@@ -174,7 +183,12 @@ export default function App() {
   const configured = isConfigured(settings);
   const isCallback = window.location.pathname.startsWith(CALLBACK_PATH);
 
-  // Callback values can arrive in the query (?…, code flows and miniOrange's /idp/openidsso implicit)
+  const endpoints = resolveEndpoints(settings);
+  const provider = PROVIDERS[settings.provider];
+  // The login this tab started (state, nonce, PKCE verifier), saved before the redirect.
+  const pending = getPendingLogin();
+
+  // Callback values can arrive in the query (?…, code flows and some implicit implementations)
   // or in the fragment (#…, standard implicit).
   const params = new URLSearchParams(window.location.search);
   const fragment = new URLSearchParams(window.location.hash.slice(1));
@@ -182,7 +196,7 @@ export default function App() {
   const code = params.get('code');
   const returnedState = fromUrl('state');
   const idpError = fromUrl('error');
-  const storedState = sessionStorage.getItem('state');
+  const storedState = pending?.state ?? null;
   const implicitTokens =
     isCallback && (fromUrl('access_token') || fromUrl('id_token'))
       ? {
@@ -199,7 +213,7 @@ export default function App() {
   const flow = isCallback
     ? implicitTokens
       ? 'implicit'
-      : settings.grantType === 'authorization_code_pkce'
+      : (pending?.grantType || settings.grantType) === 'authorization_code_pkce'
         ? 'authorization_code_pkce'
         : 'authorization_code'
     : settings.grantType;
@@ -234,7 +248,7 @@ export default function App() {
       target: () => settingsBtnRef.current,
       placement: 'bottom-end',
       title: 'Start here: Settings',
-      body: 'Click the gear to add your OAuth app: a name, base URL, client ID and client secret. Saved only in this browser.',
+      body: 'Click the gear to add your OAuth app: pick a provider (or Custom with your own endpoints), then the client ID and secret. Saved only in this browser.',
     },
     {
       target: () => appSwitcherRef.current,
@@ -271,26 +285,21 @@ export default function App() {
     if (id === settings.id) return;
     const app = apps.find((a) => a.id === id);
     setActiveApp(id);
-    logger.info('settings', `Switched to app "${app?.name}"`, { baseUrl: app?.baseUrl, grantType: app?.grantType });
+    logger.info('settings', `Switched to app "${app?.name}"`, { host: app && appHost(app), grantType: app?.grantType });
   };
 
   // Any change to which server/client/grant we're testing cancels the current run and starts at step 1.
   // Covers the app switcher, the grant type switcher and editing the active app in Settings.
   const abortRef = useRef(null);
   const [runId, setRunId] = useState(0);
-  const flowSignature = [settings.id, settings.baseUrl, settings.clientId, settings.grantType].join('|');
+  const flowSignature = [settings.id, settings.provider, endpoints.authorization, endpoints.token, settings.clientId, settings.grantType].join('|');
   const lastSignature = useRef(flowSignature);
 
   const resetFlow = () => {
     abortRef.current?.abort();
     abortRef.current = null;
-    try {
-      // Pending redirect login from mo-oauth-sdk; it belongs to the previous app/grant.
-      sessionStorage.removeItem('state');
-      sessionStorage.removeItem('code_verifier');
-    } catch {
-      /* storage blocked */
-    }
+    // Pending redirect login; it belongs to the previous app/grant.
+    clearPendingLogin();
     if (isCallback) {
       // The callback URL (code/tokens) belongs to the previous app/grant; leave it.
       window.location.replace(appUrl());
@@ -308,7 +317,7 @@ export default function App() {
     lastSignature.current = flowSignature;
     logger.info('flow', 'App or grant type changed: current flow cancelled, starting from step 1', {
       app: settings.name || '(none)',
-      baseUrl: settings.baseUrl,
+      provider: providerLabel(settings.provider),
       grantType: settings.grantType,
     });
     resetFlow();
@@ -336,9 +345,8 @@ export default function App() {
       queryParams: Object.fromEntries(params.entries()),
       fragmentParams: Object.fromEntries(fragment.entries()),
       detectedFlow: flow,
-      storedState,
+      pendingLogin: pending,
       stateMatches: storedState === returnedState,
-      storedCodeVerifier: sessionStorage.getItem('code_verifier'),
     });
     if (implicitTokens?.id_token) {
       logger.info('callback', 'Decoded id_token from the redirect', decodeJwt(implicitTokens.id_token));
@@ -369,19 +377,25 @@ export default function App() {
   const stepKey = steps[activeStep];
   const goTo = (key) => setStep(steps.indexOf(key));
 
-  // Redirect flows: authorization code, PKCE and implicit go through miniOrange's login page.
-  const login = () => {
+  // Redirect flows: authorization code, PKCE and implicit go through the provider's login page.
+  const login = async () => {
     if (!configured) {
       openSettings();
       return;
     }
     logger.clear();
-    logger.info('login', 'Settings', mask({ ...settings, redirectUri: redirectUri() }));
-    logger.info('login', 'Redirecting to authorization endpoint via mo-oauth-sdk', {
-      url: settings.brokerUri || endpointUrl(settings, 'authorize'),
-      response_type: settings.grantType === 'implicit' ? 'token' : 'code',
+    logger.info('login', 'Settings', mask({ ...settings, endpoints, redirectUri: redirectUri() }));
+    const request = await buildAuthorizationRequest(settings);
+    savePendingLogin(request.pending);
+    logger.info('login', 'Redirecting to the authorization endpoint', {
+      authorizationEndpoint: endpoints.authorization,
+      params: mask(request.params),
+      pkce: request.pending.codeVerifier
+        ? mask({ code_verifier: request.pending.codeVerifier, code_challenge: request.pending.codeChallenge })
+        : undefined,
+      fullUrl: request.url,
     });
-    startAuthorization(buildOAuthConfig(settings));
+    window.location.assign(request.url);
   };
 
   // Password grant: no redirect, the browser posts the user's credentials straight to the token endpoint.
@@ -394,21 +408,9 @@ export default function App() {
     logger.info('login', 'Settings', mask({ ...settings }));
     setBusy('password');
     setUserCall(null);
-    const form = new URLSearchParams({
-      grant_type: 'password',
-      client_id: settings.clientId,
-      client_secret: settings.clientSecret,
-      username,
-      password,
-      scope: settings.scope,
-    });
-    const url = endpointUrl(settings, 'token');
+    const { url, init } = buildTokenRequest(settings, { grant_type: 'password', username, password, scope: settings.scope });
     logger.info('token', 'Password grant: posting credentials to the token endpoint', { url, username });
-    const result = await send(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form,
-    });
+    const result = await send(url, init);
     if (!result) return;
     decodeTokens(result);
     logger[result.ok ? 'info' : 'error']('token', result.ok ? 'Password grant succeeded' : 'Password grant failed', mask(result));
@@ -426,19 +428,9 @@ export default function App() {
     logger.clear();
     logger.info('login', 'Settings', mask({ ...settings }));
     setBusy('client');
-    const form = new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: settings.clientId,
-      client_secret: settings.clientSecret,
-    });
-    if (settings.scope) form.set('scope', settings.scope);
-    const url = endpointUrl(settings, 'token');
+    const { url, init } = buildTokenRequest(settings, { grant_type: 'client_credentials', scope: settings.scope });
     logger.info('token', 'Client credentials grant: requesting a token for the client itself', { url });
-    const result = await send(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form,
-    });
+    const result = await send(url, init);
     if (!result) return;
     decodeTokens(result);
     logger[result.ok ? 'info' : 'error'](
@@ -455,25 +447,17 @@ export default function App() {
     setBusy('token');
     setUserCall(null);
 
-    // Same form the SDK sends to the token endpoint.
-    const form = new URLSearchParams({
+    const { url, init } = buildTokenRequest(settings, {
       grant_type: 'authorization_code',
-      client_id: settings.clientId,
-      client_secret: settings.clientSecret,
-      redirect_uri: redirectUri(),
       code,
-      scope: settings.scope,
+      redirect_uri: redirectUri(),
+      code_verifier: flow === 'authorization_code_pkce' ? pending?.codeVerifier : undefined,
     });
-    const verifier = sessionStorage.getItem('code_verifier');
-    if (flow === 'authorization_code_pkce' && verifier) form.set('code_verifier', verifier);
-
-    const url = endpointUrl(settings, 'token');
+    if (flow === 'authorization_code_pkce' && !pending?.codeVerifier) {
+      logger.warn('token', 'No PKCE code_verifier saved for this login (started in another tab?); the server will likely reject the code');
+    }
     logger.info('token', 'Making token request from the browser', { url });
-    const result = await send(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form,
-    });
+    const result = await send(url, init);
     if (!result) return;
     decodeTokens(result);
     logger[result.ok ? 'info' : 'error']('token', result.ok ? 'Token request succeeded' : 'Token request failed', mask(result));
@@ -483,7 +467,7 @@ export default function App() {
 
   const makeUserInfoRequest = async () => {
     setBusy('user');
-    const result = await send(endpointUrl(settings, 'userinfo'), {
+    const result = await send(endpoints.userinfo, {
       method: 'GET',
       headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
     });
@@ -494,6 +478,16 @@ export default function App() {
   };
 
   const startOver = () => (window.location.href = appUrl());
+
+  // RP-initiated logout at the provider when it has an end-session endpoint; otherwise just start over.
+  const logout = () => {
+    const idToken = flow === 'implicit' ? implicitTokens?.id_token : tokenCall?.response?.body?.id_token;
+    const url = buildLogoutUrl(settings, idToken);
+    logger.info('logout', url ? 'Redirecting to the end-session endpoint' : 'No logout endpoint set; starting over', { url });
+    clearPendingLogin();
+    if (url) window.location.assign(url);
+    else startOver();
+  };
   const back = <NavButton dir="back" onClick={() => setStep(activeStep - 1)} />;
   const errorCount = logs.filter((l) => l.level === 'error').length;
   const stateChip = (
@@ -555,7 +549,7 @@ export default function App() {
                       component="span"
                       sx={{ fontFamily: mono, fontSize: 12, color: 'text.secondary', overflow: 'hidden', textOverflow: 'ellipsis', display: { xs: 'none', sm: 'inline' } }}
                     >
-                      {hostOf(settings.baseUrl)}
+                      {appHost(settings)}
                     </Box>
                   </Stack>
                 ) : (
@@ -575,7 +569,7 @@ export default function App() {
                 </ListItemIcon>
                 <ListItemText
                   primary={a.name}
-                  secondary={`${hostOf(a.baseUrl)} · ${grantLabel(a.grantType)}`}
+                  secondary={`${appHost(a) || providerLabel(a.provider)} · ${grantLabel(a.grantType)}`}
                   primaryTypographyProps={{ fontWeight: 600, fontSize: 14 }}
                   secondaryTypographyProps={{ fontFamily: mono, fontSize: 12 }}
                 />
@@ -645,6 +639,7 @@ export default function App() {
             {stepKey === 'signin' && (
               <Home
                 settings={settings}
+                endpoints={endpoints}
                 configured={configured}
                 onLogin={login}
                 onPasswordLogin={passwordLogin}
@@ -697,8 +692,8 @@ export default function App() {
                 }
               >
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                  With the implicit grant miniOrange returns the tokens directly in the redirect, so there is no token
-                  request.
+                  With the implicit grant the provider returns the tokens directly in the redirect, so there is no
+                  token request.
                 </Typography>
                 <KeyValue
                   rows={[
@@ -712,8 +707,8 @@ export default function App() {
                 />
                 {!implicitTokens.access_token && (
                   <Alert severity="warning" variant="outlined" sx={{ mt: 2 }}>
-                    No access_token in the redirect, so user info can't be fetched. miniOrange's /idp/openidsso endpoint
-                    only returns it when the scope has more than just <code>openid</code>.
+                    No access_token in the redirect, so user info can't be fetched.{' '}
+                    {provider?.implicitNote || 'Check the scope and the response_type the server allows.'}
                   </Alert>
                 )}
                 {implicitTokens.id_token && (
@@ -731,7 +726,7 @@ export default function App() {
               <StepCard
                 icon={<TokenRoundedIcon />}
                 title="Token response (client credentials)"
-                subtitle={`POST ${endpointUrl(settings, 'token')}`}
+                subtitle={`POST ${endpoints.token || '(no token endpoint set)'}`}
                 action={
                   <Button
                     variant="contained"
@@ -763,7 +758,7 @@ export default function App() {
               <StepCard
                 icon={<TokenRoundedIcon />}
                 title="Token response (password grant)"
-                subtitle={`POST ${endpointUrl(settings, 'token')}`}
+                subtitle={`POST ${endpoints.token || '(no token endpoint set)'}`}
                 action={
                   <Button variant="outlined" startIcon={<LoginRoundedIcon />} onClick={() => goTo('signin')}>
                     Sign in again
@@ -788,7 +783,7 @@ export default function App() {
               <StepCard
                 icon={<TokenRoundedIcon />}
                 title="Token request"
-                subtitle={`POST ${endpointUrl(settings, 'token')}`}
+                subtitle={`POST ${endpoints.token || '(no token endpoint set)'}`}
                 action={
                   <Button
                     variant="contained"
@@ -819,7 +814,7 @@ export default function App() {
               <StepCard
                 icon={<PersonSearchRoundedIcon />}
                 title="User info"
-                subtitle={`GET ${endpointUrl(settings, 'userinfo')}`}
+                subtitle={`GET ${endpoints.userinfo || '(no user info endpoint set)'}`}
                 action={
                   <Button
                     variant="contained"
@@ -837,7 +832,7 @@ export default function App() {
                       variant="outlined"
                       color="error"
                       startIcon={<LogoutRoundedIcon />}
-                      onClick={() => logout(buildOAuthConfig(settings))}
+                      onClick={logout}
                     >
                       Logout
                     </Button>
@@ -889,7 +884,7 @@ function NavButton({ dir = 'next', label, ...props }) {
   );
 }
 
-function Home({ settings, configured, onLogin, onPasswordLogin, onClientCredentials, busy, onSettings, isCallback, next }) {
+function Home({ settings, endpoints, configured, onLogin, onPasswordLogin, onClientCredentials, busy, onSettings, isCallback, next }) {
   const isPassword = settings.grantType === 'password';
   const isClientCredentials = settings.grantType === 'client_credentials';
   const direct = isDirectGrant(settings.grantType);
@@ -912,7 +907,7 @@ function Home({ settings, configured, onLogin, onPasswordLogin, onClientCredenti
               ? 'Client credentials grant: the app requests a token for itself using its client ID and secret. No user, no login page.'
               : isPassword
               ? 'Password grant: enter the user’s credentials and the app exchanges them for tokens directly, with no redirect.'
-              : 'Sign in with miniOrange, then run the token and user-info calls one at a time to see exactly what the browser sends and receives.'}
+              : 'Sign in at your identity provider, then run the token and user-info calls one at a time to see exactly what the browser sends and receives.'}
           </Typography>
 
           {!configured ? (
@@ -996,7 +991,11 @@ function Home({ settings, configured, onLogin, onPasswordLogin, onClientCredenti
           ) : (
             <Box sx={{ pt: 2 }}>
               <Button size="large" variant="contained" startIcon={<LoginRoundedIcon />} onClick={onLogin} sx={{ px: 4, py: 1.4 }}>
-                {isCallback ? 'Login again' : 'Login with miniOrange'}
+                {isCallback
+                  ? 'Login again'
+                  : settings.provider === 'custom'
+                    ? `Login with ${settings.name || 'your IdP'}`
+                    : `Login with ${providerLabel(settings.provider)}`}
               </Button>
             </Box>
           )}
@@ -1017,8 +1016,17 @@ function Home({ settings, configured, onLogin, onPasswordLogin, onClientCredenti
           <KeyValue
             rows={[
               ['App name', settings.name],
-              ['Base URL', settings.baseUrl, true],
+              ['Provider', providerLabel(settings.provider)],
+              ...(settings.provider === 'custom' ? [] : [['Base URL', settings.baseUrl, true]]),
+              ...[
+                ['Authorization endpoint', endpoints.authorization],
+                ['Token endpoint', endpoints.token],
+                ['User info endpoint', endpoints.userinfo],
+              ]
+                .filter(([, v]) => v)
+                .map(([k, v]) => [k, v, true]),
               ['Client ID', settings.clientId, true],
+              ['Client auth', settings.tokenAuthMethod],
               ['Client secret', settings.clientSecret ? '•'.repeat(12) : '(not set)'],
               ['Grant type', grantLabel(settings.grantType)],
               ['Scope', settings.scope],
@@ -1029,14 +1037,14 @@ function Home({ settings, configured, onLogin, onPasswordLogin, onClientCredenti
           <Alert severity="warning" variant="outlined">
             {settings.id
               ? `"${settings.name}" is missing: ${missingFields(settings).join(', ')}. Open Settings to finish it.`
-              : 'No apps saved in this browser yet. Add one with its name, base URL, client ID and client secret.'}
+              : 'No apps saved in this browser yet. Add one: pick a provider (or Custom), then enter its endpoints and client credentials.'}
           </Alert>
         )}
 
         {!direct && (
           <Alert severity="info" variant="outlined" sx={{ mt: 3 }}>
             Register <b style={{ fontFamily: mono, wordBreak: 'break-all' }}>{redirectUri()}</b> as the Redirect-URL of
-            the OAuth app in miniOrange.
+            your OAuth app at the identity provider.
           </Alert>
         )}
 

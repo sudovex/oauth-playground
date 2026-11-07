@@ -52,13 +52,14 @@ OAuth Playground walks through a login **one step at a time** and shows everythi
 - the user-info call and a profile card,
 - a plain-English explanation when the browser blocks a call because of **CORS**.
 
-It runs entirely in your browser. There is no backend, and your settings never leave your machine except to reach the OAuth server you configured. It's built around [miniOrange](https://www.miniorange.com/) endpoints (cloud or on-premise) via [`mo-oauth-sdk`](https://www.npmjs.com/package/mo-oauth-sdk).
+It works with **any OAuth 2.0 / OpenID Connect server**: pick a built-in provider preset (miniOrange today), or choose **Custom** and enter the endpoints yourself, or load them from the server's discovery document. It runs entirely in your browser with a small built-in OAuth client and no SDK. There is no backend, and your settings never leave your machine except to reach the OAuth server you configured.
 
 ## Features
 
 | | |
 |---|---|
 | 🧭 **Guided steps** | A stepper that changes with the grant type: *Sign in → Callback → Token request → User info*. Back, forward and **Start over** at any step. |
+| 🌍 **Any OAuth / OIDC server** | Provider presets (miniOrange) or **Custom** endpoints, with one-click loading from `.well-known/openid-configuration`. |
 | 🔑 **5 grant types** | Authorization code, Authorization code + PKCE, Implicit, Password, Client credentials. Switch from the top bar. |
 | 🔍 **Full request/response view** | Status, timing, request headers and form body, response headers and body, decoded JWTs, with copy buttons everywhere. |
 | 🗂️ **Multiple apps** | Save Staging, Production, a backend service… and switch between them by name and domain. Switching cancels the running flow. |
@@ -89,7 +90,11 @@ It runs entirely in your browser. There is no backend, and your settings never l
 ## Quick start
 
 1. **Open** <https://sudovex.github.io/oauth-playground/> (or [run it locally](#run-locally--deploy)).
-2. **Add an app**: click ⚙ and enter a name, the base URL (e.g. `https://<your-domain>.xecurify.com/moas`), client ID and client secret.
+2. **Add an app**: click ⚙, give it a name and pick a **provider**:
+   - a preset such as **miniOrange**: enter just the base URL, and the endpoints are filled in;
+   - **Custom**: enter the authorization, token and (optional) user info / logout endpoints, or paste the issuer URL and click **Load**.
+
+   Then add the client ID, client secret and how the secret is sent (`client_secret_post` or `client_secret_basic`).
 3. **Register the redirect URL** shown in Settings in your OAuth app:
    ```
    https://sudovex.github.io/oauth-playground/sso/callback
@@ -115,7 +120,7 @@ Think of a hotel: you show your ID at the front desk (the **authorization server
 flowchart LR
     U["👤 Resource owner<br/>(the user)"]
     C["💻 Client<br/>(your app or<br/>this playground)"]
-    AS["🏛️ Authorization server<br/>(miniOrange)"]
+    AS["🏛️ Authorization server<br/>(your identity provider)"]
     RS["🗄️ Resource server<br/>(an API, e.g. user info)"]
 
     U -- "① wants to use" --> C
@@ -235,7 +240,7 @@ sequenceDiagram
 
 A stolen code is useless without the verifier, which never left the app.
 
-**In the playground:** the Callback step shows the stored `code_verifier` and the re-computed `code_challenge`, so you can check that they match what was sent.
+**In the playground:** the verifier and challenge are created when you click Login and kept for that login only. The logs show both, and the token request view shows the `code_verifier` being sent. No client secret is needed: if you leave it empty, none is sent.
 
 ---
 
@@ -254,10 +259,10 @@ sequenceDiagram
     Note over B: No token request. Read the tokens from the URL.
 ```
 
-**In the playground:** the step is called *Callback + tokens*. It reads tokens from either the query string (`?access_token=…`, which miniOrange's `/idp/openidsso` uses) or the URL fragment (the standard form), shows where they came from, and decodes the `id_token`.
+**In the playground:** the step is called *Callback + tokens*. It reads tokens from either the URL fragment (`#access_token=…`, the standard form) or the query string (`?access_token=…`, which some servers such as miniOrange use), shows where they came from, and decodes the `id_token`.
 
 > [!NOTE]
-> miniOrange's `/idp/openidsso` only includes an `access_token` here when the scope has more than just `openid`.
+> Some servers only return an `access_token` here when the scope has more than just `openid` (miniOrange does this).
 
 ---
 
@@ -310,7 +315,7 @@ flowchart LR
         UI["React UI<br/>stepper, cards, logs"]
         LS[("localStorage<br/>saved apps")]
         SS[("sessionStorage<br/>state, code_verifier, logs")]
-        SDK["mo-oauth-sdk<br/>builds the authorize URL"]
+        SDK["oauth.js<br/>authorize URL, state,<br/>nonce, PKCE, token requests"]
         F["fetch() + logger<br/>token, userinfo"]
         UI <--> LS
         UI <--> SS
@@ -323,7 +328,9 @@ flowchart LR
 ```
 
 - **No server of its own.** It's a static site (GitHub Pages). All calls go straight from your browser to the OAuth server.
-- **Redirect flows** (code, PKCE, implicit) use `mo-oauth-sdk` to build the authorization URL, and come back to `<site>/sso/callback`.
+- **A tiny built-in OAuth client** (`src/oauth.js`, no SDK) builds the authorization URL with `state`, `nonce` and S256 PKCE, and the token requests for every grant, with `client_secret_post` or `client_secret_basic`.
+- **Endpoints** come from a provider preset (`src/providers.js`) or from the Custom fields.
+- **Redirect flows** (code, PKCE, implicit) come back to `<site>/sso/callback`, where `state` is checked against the login that this tab started.
 - **Direct flows** (password, client credentials) post to the token endpoint immediately.
 - **Every `fetch`** is wrapped by a logger, so requests and responses appear in the logs drawer and the console.
 - **Switching app or grant type** cancels in-flight requests, clears pending login state and returns to step 1.
@@ -333,7 +340,7 @@ flowchart LR
 | Data | Where | How long |
 |---|---|---|
 | Saved apps (name, base URL, client ID/secret, scope, grant type) | `localStorage` for this site | Until you delete them in Settings or clear site data |
-| `state`, `code_verifier` of a pending login | `sessionStorage` | This tab session |
+| Pending login (`state`, `nonce`, PKCE `code_verifier`, which app started it) | `sessionStorage` | This tab session |
 | Logs | `sessionStorage` | This tab session (survive the redirect to the login page and back) |
 | End-user password (password grant) | Nowhere | Only kept in memory while sending |
 
@@ -391,23 +398,45 @@ All settings are entered in the **Settings** dialog (⚙). There is no config fi
 | Field | Required | Notes |
 |---|:---:|---|
 | **App name** | ✅ | Shown with the domain in the app switcher |
-| **Base URL** | ✅ | Cloud: `https://<domain>.xecurify.com/moas` · On-premise: your server URL |
+| **Provider** | ✅ | A preset (e.g. **miniOrange**) or **Custom** |
+| **Base URL** | Presets | e.g. miniOrange cloud `https://<domain>.xecurify.com/moas` or your on-premise URL |
+| **Broker URI** | | miniOrange only: replaces the authorization endpoint when it brokers an external IdP |
+| **Issuer / discovery URL** | | Custom only: click **Load** to fill the endpoints from `.well-known/openid-configuration` |
+| **Authorization endpoint** | Custom, redirect grants | Where the browser is sent to log in |
+| **Token endpoint** | Custom, all but implicit | Exchanges the code or credentials for tokens |
+| **User info endpoint** | | Enables the *User info* step |
+| **End session endpoint** | | Enables real logout at the provider (otherwise Logout just starts over) |
 | **Client ID** | ✅ | From the OAuth app |
-| **Client secret** | Code, Password, Client credentials | Optional for PKCE and Implicit |
+| **Client secret** | Code, Password, Client credentials | Optional for PKCE and Implicit. Not sent when empty |
+| **Client authentication** | ✅ | `client_secret_post` (in the body) or `client_secret_basic` (`Authorization: Basic` header) |
 | **Grant type** | ✅ | Also switchable from the top bar |
 | **Scope** | ✅ | Space separated, e.g. `openid email profile` |
-| **Broker URI** | | Only when the authorization server brokers an external IdP |
 | **Redirect-URL** | (generated) | `<where the app is hosted>/sso/callback`. Register it in your OAuth app |
 | **Mask secrets in logs** | | Shortens secrets and tokens in logs (applies to all apps) |
 
-**Endpoints used** (built from the base URL):
+### Provider presets
 
-| Purpose | Path |
-|---|---|
-| Authorize | `/idp/openidsso` |
-| Token | `/rest/oauth/token` |
-| User info | `/rest/oauth/getuserinfo` |
-| Logout | `/idp/oidc/logout` |
+| Preset | You enter | Endpoints derived from the base URL |
+|---|---|---|
+| **miniOrange** | Base URL | authorize `/idp/openidsso` · token `/rest/oauth/token` · user info `/rest/oauth/getuserinfo` · logout `/idp/oidc/logout` |
+| **Custom** | Every endpoint, or a discovery URL | n/a |
+
+**Adding a preset** is one entry in [`src/providers.js`](src/providers.js):
+
+```js
+okta: {
+  id: 'okta',
+  label: 'Okta',
+  description: 'Okta org authorization server.',
+  baseUrlPlaceholder: 'https://<org>.okta.com',
+  endpoints: (base) => ({
+    authorization: `${base}/oauth2/v1/authorize`,
+    token: `${base}/oauth2/v1/token`,
+    userinfo: `${base}/oauth2/v1/userinfo`,
+    endSession: `${base}/oauth2/v1/logout`,
+  }),
+},
+```
 
 ---
 
@@ -432,7 +461,9 @@ All settings are entered in the **Settings** dialog (⚙). There is no config fi
 | `invalid_grant` on the token step | The code was already used or has expired | Codes work once. **Start over** for a fresh one |
 | `invalid_client` | Wrong client ID or secret | Fix them in Settings |
 | `invalid_scope` (client credentials) | None of the requested scopes are allowed for the app | Use scopes the OAuth app permits |
-| No `access_token` with implicit | Scope is only `openid` | Add `email profile` to the scope |
+| No `access_token` with implicit | Some servers need more than `openid` in the scope | Add `email profile` to the scope |
+| Discovery **Load** fails | The discovery URL doesn't allow cross-origin requests, or it's wrong | Enter the endpoints by hand |
+| `invalid_client` with `client_secret_basic` | Server expects the secret in the body (or the reverse) | Switch **Client authentication** |
 
 ---
 
@@ -465,7 +496,8 @@ oauth-playground/
     ├── main.jsx                   # Theme provider, installs the fetch logger
     ├── App.jsx                    # Stepper, flows for each grant type, top bar
     ├── settings.js                # Saved apps store (localStorage), grant type helpers
-    ├── oauth.js                   # Endpoints + mo-oauth-sdk config
+    ├── providers.js               # Provider presets (miniOrange, Custom); add more here
+    ├── oauth.js                   # Built-in OAuth client: authorize URL, PKCE, token requests, logout
     ├── logger.js                  # Logs (sessionStorage), masking and password redaction
     ├── fetchLogger.js             # Wraps fetch to log every request/response
     ├── theme.js                   # Dark MUI theme
@@ -477,7 +509,7 @@ oauth-playground/
         └── Tour.jsx               # First-visit coach marks
 ```
 
-**Built with:** [React](https://react.dev) · [Vite](https://vitejs.dev) · [MUI](https://mui.com) · [mo-oauth-sdk](https://www.npmjs.com/package/mo-oauth-sdk)
+**Built with:** [React](https://react.dev) · [Vite](https://vitejs.dev) · [MUI](https://mui.com). No OAuth SDK: the client is a single small file, `src/oauth.js`.
 
 ## License
 

@@ -2,7 +2,7 @@ import { getSettings } from './settings';
 
 /**
  * Tiny logger: every entry goes to the browser console and to an on-page log panel.
- * Entries are kept in sessionStorage so the steps logged before the redirect to miniOrange
+ * Entries are kept in sessionStorage so the steps logged before the redirect to the identity provider
  * are still visible on the /sso/callback page.
  */
 const STORAGE_KEY = 'mo_test_logs';
